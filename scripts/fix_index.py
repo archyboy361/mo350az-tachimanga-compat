@@ -1,42 +1,68 @@
 #!/usr/bin/env python3
-"""Unwrap MO350AZ's filtered catalogue without modifying entries."""
 import json
-import sys
 from pathlib import Path
 
-def unwrap(data):
-    if isinstance(data, list):
-        entries = data
-    elif isinstance(data, dict) and isinstance(data.get("extensionList"), dict):
-        entries = data["extensionList"].get("extensions")
-    elif isinstance(data, dict):
-        candidates = [data[k] for k in ("extensions", "data", "items", "packages", "results") if isinstance(data.get(k), list)]
-        if len(candidates) != 1:
-            raise ValueError("Unknown or ambiguous wrapper; refusing to publish")
-        entries = candidates[0]
-    else:
-        raise ValueError("Unsupported index root")
-    if not isinstance(entries, list) or not entries:
-        raise ValueError("Missing or empty catalogue")
-    packages = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            raise ValueError("Entry is not an object")
-        package = entry.get("pkg", entry.get("packageName"))
-        if not isinstance(package, str) or not package:
-            raise ValueError("Missing package name")
-        packages.append(package)
-    if len(set(packages)) != len(packages):
-        raise ValueError("Duplicate packages")
-    return entries
+SOURCE = Path("index.json")
+OUTPUT = Path("index.min.json")
 
-if __name__ == "__main__":
-    path = Path(sys.argv[1] if len(sys.argv) > 1 else "index.min.json")
-    entries = unwrap(json.loads(path.read_text(encoding="utf-8-sig")))
-    encoded = (json.dumps(entries, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
-    if not encoded.startswith(b"[") or json.loads(encoded) != entries:
-        raise ValueError("Output validation failed")
-    temporary = path.with_suffix(".tmp")
-    temporary.write_bytes(encoded)
-    temporary.replace(path)
-    print(f"Verified first byte [; preserved {len(entries)} entries unchanged")
+data = json.loads(SOURCE.read_text(encoding="utf-8"))
+
+if not isinstance(data, list):
+    raise SystemExit(
+        f"MO350AZ index.json is no longer a legacy extension array "
+        f"(got {type(data).__name__}). Refusing to publish a broken Tachimanga index."
+    )
+
+required_ext = {"name", "pkg", "apk", "lang", "code", "version", "sources"}
+required_src = {"name", "lang", "id", "baseUrl"}
+
+errors = []
+for i, ext in enumerate(data):
+    if not isinstance(ext, dict):
+        errors.append(f"extension[{i}] is {type(ext).__name__}, not object")
+        continue
+
+    missing = required_ext - ext.keys()
+    if missing:
+        errors.append(f"extension[{i}] {ext.get('name', '<unnamed>')} missing {sorted(missing)}")
+        continue
+
+    sources = ext.get("sources")
+    if not isinstance(sources, list):
+        errors.append(f"extension[{i}] {ext.get('name')} sources is not an array")
+        continue
+
+    for j, src in enumerate(sources):
+        if not isinstance(src, dict):
+            errors.append(
+                f"extension[{i}] {ext.get('name')} source[{j}] is "
+                f"{type(src).__name__}, not object"
+            )
+            continue
+        missing_src = required_src - src.keys()
+        if missing_src:
+            errors.append(
+                f"extension[{i}] {ext.get('name')} source[{j}] "
+                f"{src.get('name', '<unnamed>')} missing {sorted(missing_src)}"
+            )
+
+if errors:
+    preview = "\n".join(errors[:25])
+    extra = "" if len(errors) <= 25 else f"\n... and {len(errors)-25} more"
+    raise SystemExit(
+        "index.json is not valid for Tachimanga legacy parsing:\n"
+        + preview + extra
+    )
+
+OUTPUT.write_text(
+    json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+
+# Final guard: Tachimanga expects the root token to be '['.
+with OUTPUT.open("r", encoding="utf-8") as f:
+    first = f.read(1)
+if first != "[":
+    raise SystemExit(f"Generated index starts with {first!r}, expected '['")
+
+print(f"Wrote Tachimanga-compatible legacy index with {len(data)} extensions.")
