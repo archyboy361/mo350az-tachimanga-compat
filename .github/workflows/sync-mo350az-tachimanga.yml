@@ -3,66 +3,170 @@ name: Sync MO350AZ for Tachimanga
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches:
+      - main
   schedule:
-    - cron: '7,37 * * * *'
+    - cron: "7,37 * * * *"
 
 permissions:
   contents: write
 
 concurrency:
   group: sync-mo350az-tachimanga
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
+
     steps:
       - name: Checkout trusted control branch
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: main
           fetch-depth: 1
-      - name: Generate validated legacy index and publish repo branch
+
+      - name: Build Tachimanga-compatible MO350AZ mirror
         shell: bash
         run: |
           set -euo pipefail
+
+          # Keep our trusted converter outside the branch that will be published.
           cp scripts/fix_index.py "$RUNNER_TEMP/fix_index.py"
-          git fetch --no-tags --depth=1 https://github.com/MO350AZ/extensions-no-nsfw.git repo
-          upstream_sha=$(git rev-parse FETCH_HEAD)
-          if git ls-remote --exit-code --heads origin repo > /dev/null; then
+
+          # Reuse the previous repo branch as an asset cache when it exists.
+          if git ls-remote --exit-code --heads origin repo >/dev/null 2>&1; then
             git fetch --no-tags --depth=1 origin repo
             git checkout -B repo FETCH_HEAD
           else
             git checkout --orphan repo
+            git rm -rf --ignore-unmatch .
           fi
-          git rm -rf --ignore-unmatch .
-          git clean -fd
-          # Import only data/assets; never publish or execute upstream workflows/scripts.
-          git restore --source="$upstream_sha" --staged --worktree -- apk icon jar repo.json index.pb index.json index.min.json index.html
-          python3 "$RUNNER_TEMP/fix_index.py"
+
+          # Fetch MO350AZ's current generated repository branch without executing
+          # any of its workflows or scripts.
+          git fetch --no-tags --depth=1 \
+            https://github.com/MO350AZ/extensions-no-nsfw.git repo
+
+          upstream_sha="$(git rev-parse FETCH_HEAD)"
+
+          # MO350AZ currently publishes the modern repository schema as an object.
+          # Prefer index.json, but fall back to index.min.json if upstream changes.
+          if git show "$upstream_sha:index.json" > index.json 2>/dev/null; then
+            :
+          elif git show "$upstream_sha:index.min.json" > index.json 2>/dev/null; then
+            :
+          else
+            echo "Could not read MO350AZ index.json or index.min.json" >&2
+            exit 1
+          fi
+
+          # Convert modern fields to Tachimanga/Suwayomi's legacy format and
+          # mirror the exact APK/icon assets referenced by the modern index.
+          python3 "$RUNNER_TEMP/fix_index.py" \
+            --hydrate \
+            --prune \
+            --workers 8
+
+          # Independent publication guard.
           python3 - <<'PY'
           import json
           from pathlib import Path
+
           raw = Path("index.min.json").read_bytes()
+
           if not raw.startswith(b"["):
               raise SystemExit("Generated index does not begin with [")
+
           data = json.loads(raw)
-          if not isinstance(data, list):
-              raise SystemExit("Generated index is not an array")
-          sources = [s for e in data for s in e["sources"]]
-          if len(sources) < 20 or not all("lang" in s and "baseUrl" in s for s in sources[:20]):
-              raise SystemExit("First 20 source objects failed lang/baseUrl verification")
-          print(f"Verified [ and lang/baseUrl in first 20 of {len(sources)} sources")
+
+          if not isinstance(data, list) or len(data) < 100:
+              raise SystemExit(
+                  "Generated index is not a plausible legacy extension array"
+              )
+
+          required_ext = {
+              "name", "pkg", "apk", "lang", "code",
+              "version", "nsfw", "sources"
+          }
+          required_src = {"name", "lang", "id", "baseUrl"}
+
+          source_count = 0
+
+          for i, ext in enumerate(data):
+              missing = required_ext - ext.keys()
+              if missing:
+                  raise SystemExit(
+                      f"extension[{i}] missing {sorted(missing)}"
+                  )
+
+              if "packageName" in ext or "resources" in ext:
+                  raise SystemExit(
+                      f"extension[{i}] still contains modern-schema fields"
+                  )
+
+              apk = Path("apk") / ext["apk"]
+              if not apk.is_file() or apk.stat().st_size <= 0:
+                  raise SystemExit(
+                      f"extension[{i}] APK is missing: {apk}"
+                  )
+
+              icon = Path("icon") / f"{ext['pkg']}.png"
+              if not icon.is_file() or icon.stat().st_size <= 0:
+                  raise SystemExit(
+                      f"extension[{i}] icon is missing: {icon}"
+                  )
+
+              for j, source in enumerate(ext["sources"]):
+                  source_count += 1
+                  missing_src = required_src - source.keys()
+                  if missing_src:
+                      raise SystemExit(
+                          f"extension[{i}] source[{j}] "
+                          f"missing {sorted(missing_src)}"
+                      )
+
+          first_sources = [
+              source
+              for extension in data
+              for source in extension["sources"]
+          ][:20]
+
+          if len(first_sources) < 20 or not all(
+              "lang" in source and "baseUrl" in source
+              for source in first_sources
+          ):
+              raise SystemExit(
+                  "First 20 sources failed lang/baseUrl verification"
+              )
+
+          print(
+              f"Verified {len(data)} legacy extensions "
+              f"and {source_count} sources"
+          )
           PY
+
           printf '%s\n' "$upstream_sha" > upstream-commit.txt
-          git add index.min.json upstream-commit.txt
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          if git diff --cached --quiet; then
-            echo 'Already synchronized'
-            exit 0
-          fi
-          git commit -m "Sync MO350AZ ${upstream_sha} and validate legacy index"
-          git push origin HEAD:refs/heads/repo
+
+          # The public repo branch should contain only what legacy clients need.
+          rm -f index.json repo.json index.pb index.html
+          rm -rf jar .github scripts
+
+          git add -A
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          tree_sha="$(git write-tree)"
+
+          # Publish a new root commit each run. This prevents the large APK
+          # snapshot from creating ever-growing reachable Git history.
+          commit_sha="$(
+            printf 'Sync MO350AZ %s for Tachimanga\n' "$upstream_sha" \
+              | git commit-tree "$tree_sha"
+          )"
+
+          git push --force origin "$commit_sha:refs/heads/repo"
+
+          echo "Published repo branch at commit $commit_sha"
