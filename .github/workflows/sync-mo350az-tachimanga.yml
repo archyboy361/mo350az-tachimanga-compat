@@ -1,0 +1,54 @@
+name: Sync MO350AZ for Tachimanga
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '7,37 * * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-mo350az-tachimanga
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout trusted control branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          fetch-depth: 1
+      - name: Generate and publish repo branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp scripts/fix_index.py "$RUNNER_TEMP/fix_index.py"
+          git fetch --no-tags --depth=1 https://github.com/MO350AZ/extensions-no-nsfw.git repo
+          upstream_sha=$(git rev-parse FETCH_HEAD)
+          if git ls-remote --exit-code --heads origin repo > /dev/null; then
+            git fetch --no-tags --depth=1 origin repo
+            git checkout -B repo FETCH_HEAD
+          else
+            git checkout --orphan repo
+          fi
+          git rm -rf --ignore-unmatch .
+          git clean -fd
+          # Import only data/assets; never publish or execute upstream workflows/scripts.
+          git restore --source="$upstream_sha" --staged --worktree -- apk icon jar repo.json index.pb index.json index.min.json index.html
+          python3 "$RUNNER_TEMP/fix_index.py" index.min.json
+          printf '%s\n' "$upstream_sha" > upstream-commit.txt
+          git add index.min.json upstream-commit.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git diff --cached --quiet; then
+            echo 'Already synchronized'
+            exit 0
+          fi
+          git commit -m "Sync MO350AZ ${upstream_sha} and unwrap index"
+          git push origin HEAD:refs/heads/repo
